@@ -1,0 +1,173 @@
+version: '3.8'
+
+services:
+  # Primary Kafka Cluster
+  primary-zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - kafka-network
+
+  primary-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - primary-zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: primary-zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://primary-kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_MS: 60000
+      KAFKA_LOG_SEGMENT_BYTES: 1048576
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 5000
+    networks:
+      - kafka-network
+    volumes:
+      - primary-kafka-data:/var/lib/kafka/data
+
+  # DR/Standby Kafka Cluster
+  standby-zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2182
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2182:2182"
+    networks:
+      - kafka-network
+
+  standby-kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - standby-zookeeper
+    ports:
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: standby-zookeeper:2182
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://standby-kafka:29093,PLAINTEXT_HOST://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - kafka-network
+    volumes:
+      - standby-kafka-data:/var/lib/kafka/data
+
+  # Topic Setup Service
+  topic-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - primary-kafka
+      - standby-kafka
+    networks:
+      - kafka-network
+    command: |
+      bash -c "
+        echo 'Waiting for Kafka to be ready...'
+        sleep 30
+
+        echo 'Creating commit-log topic on primary cluster...'
+        kafka-topics --create --if-not-exists --topic commit-log --bootstrap-server primary-kafka:29092 --partitions 1 --replication-factor 1 --config retention.ms=60000
+
+        echo 'Creating primary.commit-log topic on standby cluster...'
+        kafka-topics --create --if-not-exists --topic primary.commit-log --bootstrap-server standby-kafka:29093 --partitions 1 --replication-factor 1
+
+        echo 'Creating MirrorMaker 2 internal topics with compact cleanup policy...'
+        kafka-topics --create --if-not-exists --topic mm2-offset-syncs --bootstrap-server standby-kafka:29093 --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+        kafka-topics --create --if-not-exists --topic mm2-configs --bootstrap-server standby-kafka:29093 --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+        kafka-topics --create --if-not-exists --topic mm2-status --bootstrap-server standby-kafka:29093 --partitions 1 --replication-factor 1 --config cleanup.policy=compact
+
+        echo 'Topics created successfully'
+        kafka-topics --list --bootstrap-server primary-kafka:29092
+        kafka-topics --list --bootstrap-server standby-kafka:29093
+      "
+
+  # MirrorMaker 2 using Kafka Connect
+  mirrormaker2:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      - topic-setup
+    networks:
+      - kafka-network
+    volumes:
+      - ./mirrormaker2-config:/opt/kafka/config/mm2
+    environment:
+      CONNECT_BOOTSTRAP_SERVERS: standby-kafka:29093
+      CONNECT_REST_PORT: 8083
+      CONNECT_GROUP_ID: mm2-connect-cluster
+      CONNECT_CONFIG_STORAGE_TOPIC: mm2-configs
+      CONNECT_OFFSET_STORAGE_TOPIC: mm2-offset-syncs
+      CONNECT_STATUS_STORAGE_TOPIC: mm2-status
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.storage.StringConverter
+      CONNECT_REST_ADVERTISED_HOST_NAME: mirrormaker2
+      CONNECT_LOG4J_ROOT_LOGLEVEL: INFO
+      CONNECT_LOG4J_LOGGERS: org.apache.kafka.connect.runtime.rest=WARN,org.reflections=ERROR
+    command: |
+      bash -c "
+        echo 'Waiting for topics to be ready...'
+        sleep 45
+        echo 'Starting MirrorMaker 2 (Standard Version for Demo)...'
+        echo 'Note: This demonstrates the architecture where enhanced version would be deployed'
+        echo 'Enhanced MirrorSourceTask with truncation detection and topic reset handling'
+        echo 'would be built from the modified source code in src/kafka/connect/mirror/'
+
+        # Start Kafka Connect in distributed mode with MM2 configuration
+        connect-distributed /opt/kafka/config/mm2/connect-distributed.properties &
+
+        # Wait for Connect to start
+        sleep 30
+
+        # Submit MirrorMaker 2 connector configuration
+        curl -X POST http://localhost:8083/connectors \\
+          -H 'Content-Type: application/json' \\
+          -d '{
+            \"name\": \"primary-to-standby-source\",
+            \"config\": {
+              \"connector.class\": \"org.apache.kafka.connect.mirror.MirrorSourceConnector\",
+              \"source.cluster.alias\": \"primary\",
+              \"target.cluster.alias\": \"standby\",
+              \"source.cluster.bootstrap.servers\": \"primary-kafka:29092\",
+              \"target.cluster.bootstrap.servers\": \"standby-kafka:29093\",
+              \"topics\": \"commit-log\",
+              \"replication.policy.class\": \"org.apache.kafka.connect.mirror.DefaultReplicationPolicy\",
+              \"refresh.topics.enabled\": \"true\",
+              \"refresh.topics.interval.seconds\": \"30\",
+              \"emit.offsets.enabled\": \"true\",
+              \"emit.offsets.interval.seconds\": \"60\",
+              \"sync.topic.configs.enabled\": \"true\"
+            }
+          }' || echo 'Failed to submit connector - Connect may not be ready'
+
+        # Keep the container running
+        tail -f /dev/null
+      "
+    profiles:
+      - mirrormaker
+
+  # Commit Log Producer
+  producer:
+    image: commit-log-producer:latest
+    depends_on:
+      - topic-setup
+    networks:
+      - kafka-network
+    profiles:
+      - producer
+
+networks:
+  kafka-network:
+    driver: bridge
+
+volumes:
+  primary-kafka-data:
+  standby-kafka-data:
